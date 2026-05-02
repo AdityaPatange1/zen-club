@@ -32,6 +32,7 @@ from zen_club_core import (
     parse_slash,
     run_user_message,
 )
+from zen_interview import run_interview_session
 from zen_transcript import TranscriptRecorder, default_transcript_path
 
 DEFAULT_THEME = Theme(
@@ -79,6 +80,12 @@ CLI:
   --model NAME (-m)             override profile default model
   --save-transcript             append JSON Lines log under data/transcripts
   --transcripts-dir PATH        folder for logs (default: data/transcripts)
+  --interview                   timed Zen oral exam with 87-parameter report (see --help)
+  --choose-interviewer          pick examiner name / difficulty / tradition interactively
+  --interview-master NAME       set examiner display name (else default Zen monk at difficulty)
+  --interview-minutes N         5–10 (default 7)
+  --interview-difficulty S      beginner…ultimate (default ultimate)
+  --interview-output-dir DIR    markdown packet folder (default data/interviews)
 
 Slash commands:
   /add_to_group                 interactive wizard (expandable steps)
@@ -128,6 +135,46 @@ Slash commands:
         default=Path("data/transcripts"),
         metavar="DIR",
         help="Directory for transcript JSONL files (default: data/transcripts).",
+    )
+    p.add_argument(
+        "--interview",
+        action="store_true",
+        help=(
+            "Run a timed oral Zen interview (≈5–10 min) with a rigorous examiner; "
+            "writes markdown review packet under data/interviews."
+        ),
+    )
+    p.add_argument(
+        "--choose-interviewer",
+        action="store_true",
+        help="Interactive examiner setup (name, difficulty, tradition, notes).",
+    )
+    p.add_argument(
+        "--interview-master",
+        metavar="NAME",
+        default=None,
+        help="Examiner display name (omit with --choose-interviewer or use default monk).",
+    )
+    p.add_argument(
+        "--interview-minutes",
+        type=int,
+        default=7,
+        metavar="N",
+        help="Target interview length in minutes (clamped to 5–10). Default: 7.",
+    )
+    p.add_argument(
+        "--interview-difficulty",
+        choices=list(POWER_STAGES),
+        default="ultimate",
+        metavar="STAGE",
+        help="Default examiner / monk difficulty when not using --choose-interviewer.",
+    )
+    p.add_argument(
+        "--interview-output-dir",
+        type=Path,
+        default=Path("data/interviews"),
+        metavar="DIR",
+        help="Where to write zen_interview_*.md packets (default: data/interviews).",
     )
     return p
 
@@ -457,8 +504,22 @@ def main(argv: list[str] | None = None) -> int:
         Console().print_json(data=PROFILE_SCHEMA)
         return 0
 
+    if args.interview:
+        if not args.no_dotenv:
+            load_env()
+        console = Console(highlight=True, soft_wrap=False)
+        console.push_theme(DEFAULT_THEME)
+        try:
+            return run_interview_session(console, args)
+        except BrokenPipeError:
+            try:
+                sys.stdout.close()
+            except Exception:
+                pass
+            return 0
+
     if not args.profile:
-        parser.error("--profile is required unless using --schema.")
+        parser.error("--profile is required unless using --schema or --interview.")
 
     if not args.no_dotenv:
         load_env()

@@ -41,6 +41,17 @@ With Make:
 make run
 ```
 
+### Zen oral interview (separate from group chat)
+
+One-on-one timed oral exam (target **5–10 minutes**; default **7**), a rigorous “mountain” examiner (or a **named** master / **interactive** setup), then an **87-dimension** model-generated rubric. Output: `data/interviews/zen_interview_<timestamp>_<slug>.md` for a human teacher to review.
+
+```bash
+python zen_club.py --interview
+python zen_club.py --interview --choose-interviewer
+python zen_club.py --interview --interview-master "Hakuin-style Examiner" --interview-minutes 8
+python zen_club.py --interview -p data/med_group.json   # use profile’s default model if -m omitted
+```
+
 Print the machine-readable JSON Schema for profiles:
 
 ```bash

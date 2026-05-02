@@ -33,4 +33,4 @@ clean:
 	find . -name '*.pyc' -delete 2>/dev/null || true
 
 lint: install
-	$(PY) -m py_compile zen_club.py zen_club_core.py zen_analytics.py zen_search.py zen_transcript.py
+	$(PY) -m py_compile zen_club.py zen_club_core.py zen_analytics.py zen_search.py zen_transcript.py zen_interview.py
