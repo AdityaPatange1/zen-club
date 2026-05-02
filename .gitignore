@@ -147,6 +147,9 @@ activemq-data/
 # SageMath parsed files
 *.sage.py
 
+# Zen Club session transcripts (JSON Lines)
+data/transcripts/*.jsonl
+
 # Environments
 .env
 .envrc

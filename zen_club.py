@@ -7,17 +7,23 @@ Run: python zen_club.py --profile data/code_group.json
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
+from rich import box
 from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
+from rich.table import Table
 from rich.theme import Theme
 
+from zen_analytics import MessageAnalytics, analytics_to_dict, compute_message_analytics
 from zen_club_core import (
     PROFILE_SCHEMA,
+    POWER_STAGES,
+    Persona,
     ZenSession,
     get_openai_client,
     load_env,
@@ -26,6 +32,7 @@ from zen_club_core import (
     parse_slash,
     run_user_message,
 )
+from zen_transcript import TranscriptRecorder, default_transcript_path
 
 DEFAULT_THEME = Theme(
     {
@@ -49,6 +56,8 @@ LIGHT_THEME = Theme(
     }
 )
 
+_ID_OK = re.compile(r"^[a-zA-Z0-9_-]+$")
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -62,29 +71,23 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""
 Profile JSON (summary — full schema: python zen_club.py --schema or README):
   version           integer, must be 1
-  name              optional room title
-  description       optional subtitle
-  model             default OpenAI model (e.g. gpt-4o-mini)
-  temperature       0.0–2.0
-  max_tokens        per-reply cap (boost multiplies via /boost_responses)
-  response_mode     "all" (every persona replies) or "single" (round-robin)
-  personas[]        required; each item:
-      id            stable id [a-zA-Z0-9_-]
-      name          display name
-      system_prompt instructions for the agent
-      model         optional override or null
-      color         optional Rich color name for panel borders
+  web_search        optional { enabled, max_results } — DuckDuckGo snippets for agents
+  model             default model (default in app: gpt-5.4-nano)
+  personas[]        power_stage (beginner→ultimate), fun_threshold (0–1), …
 
 CLI:
-  --model NAME (-m)             override profile default model for personas without their own model
+  --model NAME (-m)             override profile default model
+  --save-transcript             append JSON Lines log under data/transcripts
+  --transcripts-dir PATH        folder for logs (default: data/transcripts)
 
 Slash commands:
-  /add_to_group <json or path>   merge a persona into the live group
-  /clear_chat                      wipe transcript (personas unchanged)
-  /boost_responses                 toggle higher max_tokens for replies
-  /light                           toggle light / low-contrast (“magic”) UI mode
-  /help                            show commands
-  /quit or /exit                   leave Zen Club
+  /add_to_group                 interactive wizard (expandable steps)
+  /add_to_group <json|path>     merge persona from JSON or file
+  /clear_chat                   wipe transcript
+  /boost_responses              slightly raise sampling temperature for replies
+  /light                        toggle low-contrast UI
+  /help                         commands
+  /quit                         exit
 """.strip(),
     )
     p.add_argument(
@@ -111,20 +114,30 @@ Slash commands:
         metavar="NAME",
         default=None,
         help=(
-            "Override the profile's default OpenAI model for all personas that do not "
-            "set their own model (e.g. gpt-5.4-mini, gpt-5-nano)."
+            "Override the profile's default OpenAI model for personas without their own model."
         ),
+    )
+    p.add_argument(
+        "--save-transcript",
+        action="store_true",
+        help="Write JSON Lines transcript to data/transcripts (see --transcripts-dir).",
+    )
+    p.add_argument(
+        "--transcripts-dir",
+        type=Path,
+        default=Path("data/transcripts"),
+        metavar="DIR",
+        help="Directory for transcript JSONL files (default: data/transcripts).",
     )
     return p
 
 
-def persona_color_tag(persona) -> str:
+def persona_color_tag(persona: Persona) -> str:
     c = (persona.color or "cyan").strip()
     return c if c else "cyan"
 
 
-def render_agent_reply(console: Console, persona, text: str, light_mode: bool) -> None:
-    """Render markdown in a panel with proper word wrap (requires soft_wrap=False on Console)."""
+def render_agent_reply(console: Console, persona: Persona, text: str, light_mode: bool) -> None:
     tag = persona_color_tag(persona)
     md = Markdown(text)
     border = "dim " + tag if light_mode else tag
@@ -136,18 +149,56 @@ def render_agent_reply(console: Console, persona, text: str, light_mode: bool) -
         padding=(1, 2),
         expand=True,
     )
-    # overflow=fold ensures long tokens wrap; crop=False avoids terminal-width clipping.
     console.print(panel, overflow="fold", crop=False)
+
+
+def _metric_bar(score: float, width: int = 14) -> str:
+    filled = int(round((max(0.0, min(100.0, score)) / 100.0) * width))
+    return "█" * filled + "·" * (width - filled)
+
+
+def render_analytics_panel(
+    console: Console,
+    analytics: MessageAnalytics,
+    light_mode: bool,
+) -> None:
+    table = Table(box=box.SIMPLE_HEAD, show_lines=False, pad_edge=False)
+    table.add_column("Metric", style="dim" if light_mode else None)
+    table.add_column("Bar", justify="left")
+    table.add_column("0–100", justify="right", style="bold")
+
+    rows = [
+        ("Enlightenment threshold", analytics.enlightenment_threshold),
+        ("Repetition threshold", analytics.repetition_threshold),
+        ("Fixation on concepts", analytics.fixation_on_concepts),
+        ("Data reliance", analytics.data_reliance),
+    ]
+    for label, score in rows:
+        table.add_row(label, _metric_bar(score), f"{score:.0f}")
+
+    border = "dim white" if light_mode else "grey42"
+    console.print(
+        Panel(
+            table,
+            title="[zen.muted]Your message — analytics[/]",
+            border_style=border,
+            padding=(0, 1),
+        ),
+        overflow="fold",
+        crop=False,
+    )
 
 
 def print_banner(console: Console, session: ZenSession) -> None:
     prof = session.profile
+    ws = prof.web_search
+    ws_note = "on" if ws.enabled else "off"
     meta = Group(
         Markdown(f"## {prof.name}"),
         Markdown(prof.description or "_No description._"),
         Markdown(
             f"**Model:** `{prof.model}` · **Mode:** `{prof.response_mode}` · "
-            f"**Personas:** {len(prof.personas)}"
+            f"**Personas:** {len(prof.personas)} · **Web search:** `{ws_note}`"
         ),
     )
     console.print(
@@ -163,15 +214,118 @@ def print_banner(console: Console, session: ZenSession) -> None:
     )
 
 
+def run_interactive_persona_wizard(console: Console, session: ZenSession) -> None:
+    """Step-by-step persona builder with expandable panels per stage."""
+    steps = [
+        "Identity",
+        "Voice",
+        "Power & play",
+    ]
+    console.print(
+        Panel(
+            Markdown(
+                "### Add persona — guided setup\n"
+                f"Steps: **{' → '.join(steps)}**. Expand each section by answering prompts."
+            ),
+            title="[zen.title]New persona[/]",
+            border_style="green",
+            padding=(1, 2),
+        ),
+        overflow="fold",
+        crop=False,
+    )
+
+    console.print(Panel("[bold]Step 1 — Identity[/]", border_style="blue", expand=False))
+    pid = Prompt.ask("Short id [a-z A-Z 0-9 _ -]", console=console).strip()
+    if not _ID_OK.match(pid):
+        console.print("[zen.error]Invalid id. Use letters, digits, underscore, hyphen only.[/]")
+        return
+    name = Prompt.ask("Display name", console=console).strip()
+    if not name:
+        console.print("[zen.error]Name required.[/]")
+        return
+
+    console.print(
+        Panel("[bold]Step 2 — Voice[/]", border_style="blue", expand=False),
+        overflow="fold",
+        crop=False,
+    )
+    console.print(
+        "[dim]System prompt: enter lines below; finish with a single line containing only a dot (.)[/]"
+    )
+    lines: list[str] = []
+    while True:
+        try:
+            line = input()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[zen.error]Aborted.[/]")
+            return
+        if line.strip() == ".":
+            break
+        lines.append(line)
+    system_prompt = "\n".join(lines).strip()
+    if not system_prompt:
+        console.print("[zen.error]Empty system prompt.[/]")
+        return
+
+    color = Prompt.ask("Panel border color (Rich name)", default="cyan", console=console).strip()
+
+    console.print(
+        Panel("[bold]Step 3 — Power & play[/]", border_style="blue", expand=False),
+        overflow="fold",
+        crop=False,
+    )
+    stage = Prompt.ask(
+        "Power stage",
+        choices=list(POWER_STAGES),
+        default="beginner",
+        console=console,
+    )
+    ft_raw = Prompt.ask(
+        "Fun threshold (0 = serious only, 1 = more room for light touches)",
+        default="0.15",
+        console=console,
+    ).strip()
+    try:
+        ft = max(0.0, min(1.0, float(ft_raw)))
+    except ValueError:
+        ft = 0.15
+
+    persona = Persona(
+        id=pid,
+        name=name,
+        system_prompt=system_prompt,
+        model=None,
+        color=color or "cyan",
+        power_stage=stage,
+        fun_threshold=ft,
+    )
+    try:
+        session.add_persona(persona)
+    except ValueError as e:
+        console.print(f"[zen.error]{e}[/]")
+        return
+
+    console.print(
+        Panel(
+            Markdown(
+                f"**Added:** `{persona.id}` — _{persona.name}_  \n"
+                f"**Stage:** `{persona.power_stage}` · **Fun:** `{persona.fun_threshold:.2f}`"
+            ),
+            title="[green]Saved[/]",
+            border_style="green",
+        ),
+        overflow="fold",
+        crop=False,
+    )
+
+
 def handle_slash(
     console: Console,
     session: ZenSession,
     command: str,
     arg: str,
 ) -> bool:
-    """
-    Process a slash command. Returns False if the REPL should exit.
-    """
     if command in ("quit", "exit", "q"):
         console.print("[zen.muted]Goodbye.[/]")
         return False
@@ -183,17 +337,20 @@ def handle_slash(
                     """
 | Command | Action |
 |---------|--------|
-| `/add_to_group` | Add a persona: inline JSON object or path to a JSON file |
+| `/add_to_group` | Interactive wizard (no args) or JSON / file path |
+| `/add_persona` | Same as `/add_to_group` with no args |
 | `/clear_chat` | Clear transcript |
-| `/boost_responses` | Toggle larger replies (max_tokens × ~1.75) |
-| `/light` | Toggle light / subtle UI (magic-friendly) |
+| `/boost_responses` | Toggle slightly higher sampling temperature |
+| `/light` | Toggle subtle UI |
 | `/help` | This help |
 | `/quit` | Exit |
 """
                 ),
                 title="Commands",
                 border_style="blue",
-            )
+            ),
+            overflow="fold",
+            crop=False,
         )
         return True
 
@@ -219,11 +376,9 @@ def handle_slash(
         console.print(f"[zen.muted]Light mode: [bold]{state}[/][/]")
         return True
 
-    if command == "add_to_group":
+    if command in ("add_to_group", "add_persona"):
         if not arg:
-            console.print(
-                "[zen.error]Usage:[/] `/add_to_group` followed by JSON or a path to a persona JSON file."
-            )
+            run_interactive_persona_wizard(console, session)
             return True
         try:
             persona = load_persona_from_add_arg(arg)
@@ -239,7 +394,12 @@ def handle_slash(
     return True
 
 
-def repl_loop(console: Console, session: ZenSession, client) -> None:
+def repl_loop(
+    console: Console,
+    session: ZenSession,
+    client,
+    recorder: TranscriptRecorder | None,
+) -> None:
     while True:
         try:
             line = Prompt.ask(
@@ -260,11 +420,31 @@ def repl_loop(console: Console, session: ZenSession, client) -> None:
                 break
             continue
 
+        prior_user_lines = session.recent_user_messages()
+        analytics = compute_message_analytics(line, prior_user_lines)
+
         try:
             with console.status("[zen.muted]Zen agents are thinking…[/]", spinner="dots"):
-                pairs = run_user_message(client, session, line)
+                pairs, web_snippets = run_user_message(client, session, line)
+            web_used = bool(web_snippets.strip())
+
+            if recorder and pairs:
+                recorder.log_user(line, analytics_to_dict(analytics))
+
             for persona, text in pairs:
                 render_agent_reply(console, persona, text, session.light_mode)
+                render_analytics_panel(console, analytics, session.light_mode)
+                if recorder:
+                    model = persona.model or session.profile.model
+                    recorder.log_agent(
+                        persona_id=persona.id,
+                        persona_name=persona.name,
+                        content=text,
+                        power_stage=persona.power_stage,
+                        fun_threshold=persona.fun_threshold,
+                        model=model,
+                        web_search_used=web_used,
+                    )
         except Exception as e:
             console.print(f"[zen.error]Request failed:[/] {e}")
 
@@ -294,9 +474,21 @@ def main(argv: list[str] | None = None) -> int:
         profile.model = args.model.strip()
 
     session = ZenSession(profile=profile)
-    # soft_wrap=True disables word wrap in Rich print() (no_wrap), which clips panel text.
     console = Console(highlight=True, soft_wrap=False)
     console.push_theme(LIGHT_THEME if session.light_mode else DEFAULT_THEME)
+
+    recorder: TranscriptRecorder | None = None
+    if args.save_transcript:
+        tdir = args.transcripts_dir.expanduser().resolve()
+        tpath = default_transcript_path(profile.name, tdir)
+        recorder = TranscriptRecorder(
+            tpath,
+            profile_path=str(profile_path.resolve()),
+            profile_name=profile.name,
+            default_model=profile.model,
+            meta={"cli_model_override": args.model},
+        )
+        console.print(f"[zen.muted]Transcript log:[/] [bold]{tpath}[/]")
 
     try:
         client = get_openai_client()
@@ -307,13 +499,16 @@ def main(argv: list[str] | None = None) -> int:
     print_banner(console, session)
 
     try:
-        repl_loop(console, session, client)
+        repl_loop(console, session, client, recorder)
     except BrokenPipeError:
         try:
             sys.stdout.close()
         except Exception:
             pass
         return 0
+    finally:
+        if recorder:
+            recorder.log_session_end("exit")
 
     return 0
 
